@@ -14,8 +14,8 @@
 #include "settings.h"
 #include "coinparams.h"
 
-#include <uchar_vector.h>
-#include <CoinQ_script.h>
+#include <stdutils/uchar_vector.h>
+#include <CoinQ/CoinQ_script.h>
 
 #include <QDialogButtonBox>
 #include <QPushButton>

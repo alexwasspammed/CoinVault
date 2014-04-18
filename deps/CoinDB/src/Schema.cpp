@@ -11,15 +11,14 @@
 
 #include <stdutils/stringutils.h>
 
-#include <uchar_vector.h>
-#include <hash.h>
-#include <CoinNodeData.h>
-#include <hdkeys.h>
-#include <aes.h>
+#include <CoinCore/hash.h>
+#include <CoinCore/CoinNodeData.h>
+#include <CoinCore/hdkeys.h>
+#include <CoinCore/aes.h>
 
-#include <CoinQ_script.h>
+#include <CoinQ/CoinQ_script.h>
 
-#include <logger.h>
+#include <logger/logger.h>
 
 //#define ENABLE_CRYPTO
 
@@ -30,23 +29,26 @@ using namespace CoinDB;
  */
 
 Keychain::Keychain(const std::string& name, const secure_bytes_t& entropy, const secure_bytes_t& lock_key, const bytes_t& salt)
-    : name_(name)
+    : name_(name), hidden_(false)
 {
     if (name.empty() || name[0] == '@') throw std::runtime_error("Invalid keychain name.");
 
-    Coin::HDSeed hdSeed(entropy);
-    Coin::HDKeychain hdKeychain(hdSeed.getMasterKey(), hdSeed.getMasterChainCode());
+    if (!entropy.empty())
+    {
+        Coin::HDSeed hdSeed(entropy);
+        Coin::HDKeychain hdKeychain(hdSeed.getMasterKey(), hdSeed.getMasterChainCode());
 
-    depth_ = (uint32_t)hdKeychain.depth();
-    parent_fp_ = hdKeychain.parent_fp();
-    child_num_ = hdKeychain.child_num();
-    chain_code_ = hdKeychain.chain_code();
-    privkey_ = hdKeychain.key();
-    pubkey_ = hdKeychain.pubkey();
-    hash_ = hdKeychain.full_hash();
+        depth_ = (uint32_t)hdKeychain.depth();
+        parent_fp_ = hdKeychain.parent_fp();
+        child_num_ = hdKeychain.child_num();
+        chain_code_ = hdKeychain.chain_code();
+        privkey_ = hdKeychain.key();
+        pubkey_ = hdKeychain.pubkey();
+        hash_ = hdKeychain.full_hash();
 
-    setPrivateKeyUnlockKey(lock_key, salt);
-    setChainCodeUnlockKey(lock_key, salt);
+        setPrivateKeyUnlockKey(lock_key, salt);
+        setChainCodeUnlockKey(lock_key, salt);
+    }
 }
 
 Keychain& Keychain::operator=(const Keychain& source)
@@ -72,6 +74,8 @@ Keychain& Keychain::operator=(const Keychain& source)
     hashdata += chain_code_;
     hash_ = ripemd160(sha256(hashdata));
 
+    hidden_ = source.hidden_;
+
     return *this;
 }
 
@@ -84,7 +88,7 @@ std::shared_ptr<Keychain> Keychain::child(uint32_t i, bool get_private)
         if (privkey_.empty()) throw std::runtime_error("Private key is locked.");
         Coin::HDKeychain hdkeychain(privkey_, chain_code_, child_num_, parent_fp_, depth_);
         hdkeychain = hdkeychain.getChild(i);
-        std::shared_ptr<Keychain> child(new Keychain());;
+        std::shared_ptr<Keychain> child(new Keychain());
         child->parent_ = get_shared_ptr();
         secure_bytes_t privkey = hdkeychain.privkey();
         // Strip leading zero byte if necessary
@@ -283,6 +287,27 @@ void Keychain::importPrivateKey(const Keychain& source)
     privkey_salt_ = source.privkey_salt_;
 }
 
+void Keychain::extkey(const secure_bytes_t& extkey, bool try_private, const secure_bytes_t& lock_key, const bytes_t& salt)
+{
+    Coin::HDKeychain hdKeychain(extkey);
+
+    depth_ = (uint32_t)hdKeychain.depth();
+    parent_fp_ = hdKeychain.parent_fp();
+    child_num_ = hdKeychain.child_num();
+    chain_code_ = hdKeychain.chain_code();
+    if (hdKeychain.isPrivate() && try_private)
+    {
+        privkey_ = hdKeychain.key();
+        setPrivateKeyUnlockKey(lock_key, salt);
+    }
+    else
+    {
+        privkey_.clear();
+    }
+    pubkey_ = hdKeychain.pubkey();
+    hash_ = hdKeychain.full_hash();
+}
+
 secure_bytes_t Keychain::extkey(bool get_private) const
 {
     if (get_private && !isPrivate()) throw std::runtime_error("Missing private key.");
@@ -381,11 +406,6 @@ AccountInfo Account::accountInfo() const
     return AccountInfo(id_, name_, minsigs_, keychain_names, unused_pool_size_, time_created_, bin_names);
 }
 
-
-/*
- * class AccountBin
- */
-
 std::shared_ptr<AccountBin> Account::addBin(const std::string& name)
 {
     uint32_t index = bins_.size() + 1;
@@ -394,23 +414,57 @@ std::shared_ptr<AccountBin> Account::addBin(const std::string& name)
     return bin;
 }
 
+
+/*
+ * class AccountBin
+ */
+
 AccountBin::AccountBin(std::shared_ptr<Account> account, uint32_t index, const std::string& name)
-    : account_(account), index_(index), name_(name), script_count_(0), next_script_index_(0)
+    : account_(account), index_(index), name_(name), script_count_(0), next_script_index_(0), minsigs_(account->minsigs())
 {
     if (index == 0) throw std::runtime_error("Account bin index cannot be zero.");
     if (index == CHANGE_INDEX && name != CHANGE_BIN_NAME) throw std::runtime_error("Account bin index reserved for change.");
     if (index == DEFAULT_INDEX && name != DEFAULT_BIN_NAME) throw std::runtime_error("Account bin index reserved for default."); 
+
+    updateHash();
 }
 
-bool AccountBin::loadKeychains(bool get_private)
+std::string AccountBin::account_name() const
 {
-    if (!keychains_.empty()) return false;
-    for (auto& keychain: account()->keychains())
+    return account() ? account()->name() : std::string("@null");
+}
+
+void AccountBin::loadKeychains() const
+{
+    if (!keychains__.empty()) return;
+    if (!account())
     {
-        std::shared_ptr<Keychain> child(keychain->child(index_, get_private));
-        keychains_.insert(child);
+        // If we do not have an account for this bin we cannot derive the keychains, so use the stored values.
+        keychains__ = keychains_;
     }
-    return true;
+    else
+    {
+        for (auto& keychain: account()->keychains())
+        {
+            std::shared_ptr<Keychain> child(keychain->child(index_));
+            keychains__.insert(child);
+        }
+    }
+}
+
+void AccountBin::updateHash()
+{
+    loadKeychains();
+
+    std::vector<bytes_t> keychain_hashes;
+    for (auto& keychain: keychains__) { keychain_hashes.push_back(keychain->hash()); }
+    std::sort(keychain_hashes.begin(), keychain_hashes.end());
+
+    uchar_vector data;
+    data.push_back((unsigned char)minsigs_);
+    for (auto& keychain_hash: keychain_hashes) { data += keychain_hash; }
+
+    hash_ = ripemd160(sha256(data));
 }
 
 std::shared_ptr<SigningScript> AccountBin::newSigningScript(const std::string& label)
@@ -425,6 +479,21 @@ void AccountBin::markSigningScriptIssued(uint32_t script_index)
         next_script_index_ = script_index + 1;
 }
 
+void AccountBin::makeExport(const std::string& name)
+{
+    name_ = name;
+    loadKeychains();
+    keychains_ = keychains__;
+    for (auto& keychain: keychains_) { keychain->name(""); }
+    index_ = 0;
+    account_.reset();
+}
+
+void AccountBin::makeImport()
+{
+    updateHash();
+    keychains_.clear();
+}
 
 
 /*
@@ -458,8 +527,8 @@ std::vector<SigningScript::status_t> SigningScript::getStatusFlags(int status)
 SigningScript::SigningScript(std::shared_ptr<AccountBin> account_bin, uint32_t index, const std::string& label, status_t status)
     : account_(account_bin->account()), account_bin_(account_bin), index_(index), label_(label), status_(status)
 {
-    account_bin_->loadKeychains();
-    for (auto& keychain: account_bin_->keychains())
+    auto& keychains = account_bin_->keychains();
+    for (auto& keychain: keychains)
     {
         std::shared_ptr<Key> key(new Key(keychain, index));
         keys_.push_back(key);
@@ -470,7 +539,7 @@ SigningScript::SigningScript(std::shared_ptr<AccountBin> account_bin, uint32_t i
 
     std::vector<bytes_t> pubkeys;
     for (auto& key: keys_) { pubkeys.push_back(key->pubkey()); }
-    CoinQ::Script::Script script(CoinQ::Script::Script::PAY_TO_MULTISIG_SCRIPT_HASH, account_->minsigs(), pubkeys);
+    CoinQ::Script::Script script(CoinQ::Script::Script::PAY_TO_MULTISIG_SCRIPT_HASH, account_bin->minsigs(), pubkeys);
     txinscript_ = script.txinscript(CoinQ::Script::Script::EDIT);
     txoutscript_ = script.txoutscript();
 }
@@ -486,7 +555,7 @@ void SigningScript::status(status_t status)
  * class BlockHeader
  */
 
-void BlockHeader::fromCoinClasses(const Coin::CoinBlockHeader& blockheader, uint32_t height)
+void BlockHeader::fromCoinCore(const Coin::CoinBlockHeader& blockheader, uint32_t height)
 {
     hash_ = blockheader.getHashLittleEndian();
     height_ = height;
@@ -498,7 +567,7 @@ void BlockHeader::fromCoinClasses(const Coin::CoinBlockHeader& blockheader, uint
     nonce_ = blockheader.nonce;
 }
 
-Coin::CoinBlockHeader BlockHeader::toCoinClasses() const
+Coin::CoinBlockHeader BlockHeader::toCoinCore() const
 {
     return Coin::CoinBlockHeader(version_, timestamp_, bits_, nonce_, prevhash_, merkleroot_);
 }
@@ -508,7 +577,7 @@ Coin::CoinBlockHeader BlockHeader::toCoinClasses() const
  * class MerkleBlock
  */
 
-void MerkleBlock::fromCoinClasses(const Coin::MerkleBlock& merkleblock, uint32_t height)
+void MerkleBlock::fromCoinCore(const Coin::MerkleBlock& merkleblock, uint32_t height)
 {
     blockheader_ = std::shared_ptr<BlockHeader>(new BlockHeader(merkleblock.blockHeader, height));
     txcount_ = merkleblock.nTxs;
@@ -517,10 +586,10 @@ void MerkleBlock::fromCoinClasses(const Coin::MerkleBlock& merkleblock, uint32_t
     flags_ = merkleblock.flags;
 }
 
-Coin::MerkleBlock MerkleBlock::toCoinClasses() const
+Coin::MerkleBlock MerkleBlock::toCoinCore() const
 {
     Coin::MerkleBlock merkleblock;
-    merkleblock.blockHeader = blockheader_->toCoinClasses();
+    merkleblock.blockHeader = blockheader_->toCoinCore();
     merkleblock.nTxs = txcount_;
     merkleblock.hashes.assign(hashes_.begin(), hashes_.end());
     for (auto& hash: merkleblock.hashes) { std::reverse(hash.begin(), hash.end()); }
@@ -550,7 +619,7 @@ TxIn::TxIn(const bytes_t& raw)
     sequence_ = coin_txin.sequence;
 }
 
-Coin::TxIn TxIn::toCoinClasses() const
+Coin::TxIn TxIn::toCoinCore() const
 {
     Coin::TxIn coin_txin;
     coin_txin.previousOut = Coin::OutPoint(outhash_, outindex_);
@@ -561,7 +630,7 @@ Coin::TxIn TxIn::toCoinClasses() const
 
 bytes_t TxIn::raw() const
 {
-    return toCoinClasses().getSerialized();
+    return toCoinCore().getSerialized();
 }
 
 
@@ -643,7 +712,7 @@ void TxOut::signingscript(std::shared_ptr<SigningScript> signingscript)
     signingscript_ = signingscript;
 }
 
-Coin::TxOut TxOut::toCoinClasses() const
+Coin::TxOut TxOut::toCoinCore() const
 {
     Coin::TxOut coin_txout;
     coin_txout.value = value_;
@@ -653,7 +722,7 @@ Coin::TxOut TxOut::toCoinClasses() const
 
 bytes_t TxOut::raw() const
 {
-    return toCoinClasses().getSerialized();
+    return toCoinCore().getSerialized();
 }
 
 
@@ -715,7 +784,7 @@ void Tx::set(uint32_t version, const txins_t& txins, const txouts_t& txouts, uin
     locktime_ = locktime;
     timestamp_ = timestamp;
 
-    Coin::Transaction coin_tx = toCoinClasses();
+    Coin::Transaction coin_tx = toCoinCore();
 
     if (missingSigCount())  { status_ = UNSIGNED; }
     else                    { status_ = status; hash_ = coin_tx.getHashLittleEndian(); }
@@ -726,8 +795,8 @@ void Tx::set(uint32_t version, const txins_t& txins, const txouts_t& txouts, uin
 
 void Tx::set(Coin::Transaction coin_tx, uint32_t timestamp, status_t status)
 {
-    LOGGER(trace) << "Tx::set - fromCoinClasses(coin_tx);" << std::endl;
-    fromCoinClasses(coin_tx);
+    LOGGER(trace) << "Tx::set - fromCoinCore(coin_tx);" << std::endl;
+    fromCoinCore(coin_tx);
 
     timestamp_ = timestamp;
 
@@ -741,7 +810,7 @@ void Tx::set(Coin::Transaction coin_tx, uint32_t timestamp, status_t status)
 void Tx::set(const bytes_t& raw, uint32_t timestamp, status_t status)
 {
     Coin::Transaction coin_tx(raw);
-    fromCoinClasses(coin_tx);
+    fromCoinCore(coin_tx);
     timestamp_ = timestamp;
 
     if (missingSigCount())  { status_ = UNSIGNED; }
@@ -778,7 +847,7 @@ bool Tx::updateStatus(status_t status /* = NO_STATUS */)
             status_ = status;
         }
 
-        hash_ = toCoinClasses().getHashLittleEndian();
+        hash_ = toCoinCore().getHashLittleEndian();
         return true;
     }
 
@@ -792,12 +861,12 @@ bool Tx::updateStatus(status_t status /* = NO_STATUS */)
     return false;
 }
 
-Coin::Transaction Tx::toCoinClasses() const
+Coin::Transaction Tx::toCoinCore() const
 {
     Coin::Transaction coin_tx;
     coin_tx.version = version_;
-    for (auto& txin:  txins_) { coin_tx.inputs.push_back(txin->toCoinClasses()); }
-    for (auto& txout: txouts_) { coin_tx.outputs.push_back(txout->toCoinClasses()); }
+    for (auto& txin:  txins_) { coin_tx.inputs.push_back(txin->toCoinCore()); }
+    for (auto& txout: txouts_) { coin_tx.outputs.push_back(txout->toCoinCore()); }
     coin_tx.lockTime = locktime_;
     return coin_tx;
 }
@@ -817,7 +886,7 @@ void Tx::blockheader(std::shared_ptr<BlockHeader> blockheader)
 
 bytes_t Tx::raw() const
 {
-    return toCoinClasses().getSerialized();
+    return toCoinCore().getSerialized();
 }
 
 void Tx::shuffle_txins()
@@ -834,7 +903,7 @@ void Tx::shuffle_txouts()
     for (auto& txout: txouts_) { txout->txindex(i++); }
 }
 
-void Tx::fromCoinClasses(const Coin::Transaction& coin_tx)
+void Tx::fromCoinCore(const Coin::Transaction& coin_tx)
 {
     version_ = coin_tx.version;
 

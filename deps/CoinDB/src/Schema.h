@@ -11,10 +11,10 @@
 #ifndef COINDB_SCHEMA_H
 #define COINDB_SCHEMA_H
 
-#include <CoinNodeData.h>
+#include <CoinCore/CoinNodeData.h>
 
-#include <CoinQ_typedefs.h>
-#include <CoinQ_blocks.h>
+#include <CoinQ/CoinQ_typedefs.h>
+#include <CoinQ/CoinQ_blocks.h>
 
 #include <odb/core.hxx>
 #include <odb/nullable.hxx>
@@ -30,6 +30,8 @@
 #include <boost/serialization/vector.hpp>
 #include <boost/serialization/set.hpp>
 
+#include <logger/logger.h>
+
 #pragma db namespace session
 namespace CoinDB
 {
@@ -42,7 +44,12 @@ typedef odb::nullable<unsigned long> null_id_t;
 // SCHEMA VERSION //
 ////////////////////
 
-const uint32_t SCHEMA_VERSION = 3;
+#define SCHEMA_BASE_VERSION 4
+#define SCHEMA_VERSION      5
+
+#ifdef ODB_COMPILER
+#pragma db model version(SCHEMA_BASE_VERSION, SCHEMA_VERSION, open)
+#endif
 
 #pragma db object pointer(std::shared_ptr)
 class Version
@@ -77,10 +84,10 @@ class SigningScript;
 class Keychain : public std::enable_shared_from_this<Keychain>
 {
 public:
-    Keychain() { }
-    Keychain(const std::string& name, const secure_bytes_t& entropy, const secure_bytes_t& lock_key = secure_bytes_t(), const bytes_t& salt = bytes_t()); // Creates a new root keychain
+    Keychain(bool hidden = false) : hidden_(hidden) { }
+    Keychain(const std::string& name, const secure_bytes_t& entropy = secure_bytes_t(), const secure_bytes_t& lock_key = secure_bytes_t(), const bytes_t& salt = bytes_t()); // Creates a new root keychain
     Keychain(const Keychain& source)
-        : name_(source.name_), depth_(source.depth_), parent_fp_(source.parent_fp_), child_num_(source.child_num_), pubkey_(source.pubkey_), chain_code_(source.chain_code_), chain_code_ciphertext_(source.chain_code_ciphertext_), chain_code_salt_(source.chain_code_salt_), privkey_(source.privkey_), privkey_ciphertext_(source.privkey_ciphertext_), privkey_salt_(source.privkey_salt_), parent_(source.parent_), derivation_path_(source.derivation_path_) { }
+        : name_(source.name_), depth_(source.depth_), parent_fp_(source.parent_fp_), child_num_(source.child_num_), pubkey_(source.pubkey_), chain_code_(source.chain_code_), chain_code_ciphertext_(source.chain_code_ciphertext_), chain_code_salt_(source.chain_code_salt_), privkey_(source.privkey_), privkey_ciphertext_(source.privkey_ciphertext_), privkey_salt_(source.privkey_salt_), parent_(source.parent_), derivation_path_(source.derivation_path_), hidden_(source.hidden_) { }
 
     Keychain& operator=(const Keychain& source);
 
@@ -132,6 +139,10 @@ public:
     // hash = ripemd160(sha256(pubkey + chain_code))
     const bytes_t& hash() const { return hash_; }
 
+    void hidden(bool hidden) { hidden_ = hidden; }
+    bool hidden() const { return hidden_; }
+
+    void extkey(const secure_bytes_t& extkey, bool try_private = true, const secure_bytes_t& lock_key = secure_bytes_t(), const bytes_t& salt = bytes_t());
     secure_bytes_t extkey(bool get_private = false) const;
 
     void clearPrivateKey();
@@ -168,6 +179,8 @@ private:
     std::vector<std::weak_ptr<Keychain>> children_;
 
     bytes_t hash_;
+
+    bool hidden_; // whether to display in UI
 
     friend class boost::serialization::access;
     template<class Archive>
@@ -246,12 +259,14 @@ public:
 
     AccountBin() { }
     AccountBin(std::shared_ptr<Account> account, uint32_t index, const std::string& name);
-    AccountBin(const AccountBin& source) : account_(source.account_), index_(source.index_), name_(source.name_), script_count_(source.script_count_), next_script_index_(source.next_script_index_), keychains_(source.keychains_) { }
+    AccountBin(const AccountBin& source) : account_(source.account_), index_(source.index_), name_(source.name_), script_count_(source.script_count_), next_script_index_(source.next_script_index_), minsigs_(source.minsigs_), keychains_(source.keychains_), keychains__(source.keychains__) { }
 
     unsigned long id() const { return id_; }
 
     void account(std::shared_ptr<Account> account) { account_ = account; }
     std::shared_ptr<Account> account() const { return account_.lock(); }
+
+    std::string account_name() const;
 
     uint32_t index() const { return index_; }
 
@@ -261,22 +276,32 @@ public:
     uint32_t script_count() const { return script_count_; }
     uint32_t next_script_index() const { return next_script_index_; }
 
+    uint32_t minsigs() const { return minsigs_; }
+
     std::shared_ptr<SigningScript> newSigningScript(const std::string& label = "");
     void markSigningScriptIssued(uint32_t script_index);
 
-    bool loadKeychains(bool get_private = false);
-    KeychainSet keychains() const { return keychains_; }
+    void keychains(const KeychainSet& keychains) { keychains_ = keychains; keychains__ = keychains; } // only used for imported account bins
+    const KeychainSet& keychains() const { loadKeychains(); return keychains__; }
 
     bool isChange() const { return index_ == CHANGE_INDEX; }
     bool isDefault() const { return index_ == DEFAULT_INDEX; }
 
+    void makeExport(const std::string& name);
+    void makeImport();
+
+    void updateHash();
+    const bytes_t& hash() const { return hash_; }
+
 private:
+    void loadKeychains() const;
+
     friend class odb::access;
 
     #pragma db id auto
     unsigned long id_;
 
-    #pragma db value_not_null
+    #pragma db null
     std::weak_ptr<Account> account_;
     uint32_t index_;
     std::string name_;
@@ -284,8 +309,16 @@ private:
     uint32_t script_count_;
     uint32_t next_script_index_; // index of next script in pool that will be issued
 
-    #pragma db transient
+    uint32_t minsigs_;
+
+    // Keychains are only stored in database for nonderived keychains. Otherwise, they are transient and loaded only via loadKeychains().
+    #pragma db value_not_null
     KeychainSet keychains_;
+    #pragma db transient
+    mutable KeychainSet keychains__;
+
+    #pragma db unique
+    bytes_t hash_; // ripemd160(sha256(data)) where data = concat(first byte(minsigs), keychain hash 1, keychain hash 2, ...) and keychain hashes are sorted lexically
 
     friend class boost::serialization::access;
     template<class Archive>
@@ -294,7 +327,11 @@ private:
         ar & name_;
         ar & index_;
         ar & next_script_index_;
-//        ar & keychains_; // useful for exporting the account bin independently from account
+        ar & minsigs_;
+
+        uint32_t n = keychains_.size();
+        ar & n;
+        for (auto& keychain: keychains_)    { ar & *keychain; }
     }
     template<class Archive>
     void load(Archive& ar, const unsigned int /*version*/)
@@ -302,7 +339,18 @@ private:
         ar & name_;
         ar & index_;
         ar & next_script_index_;
- //       ar & keychains_; // useful for importing the account bin independently from account
+        ar & minsigs_;
+
+        uint32_t n;
+        ar & n;
+        keychains_.clear();
+        for (uint32_t i = 0; i < n; i++)
+        {
+            std::shared_ptr<Keychain> keychain(new Keychain(true)); // Load these keychains as hidden keychains.
+            ar & *keychain;
+            keychains_.insert(keychain);
+        }
+        keychains__ = keychains_;
         script_count_ = 0;
     }
     BOOST_SERIALIZATION_SPLIT_MEMBER()
@@ -374,12 +422,14 @@ private:
     std::vector<std::string>    bin_names_;
 };
 
+const uint32_t DEFAULT_UNUSED_POOL_SIZE = 25;
+
 #pragma db object pointer(std::shared_ptr)
 class Account : public std::enable_shared_from_this<Account>
 {
 public:
     Account() { }
-    Account(const std::string& name, unsigned int minsigs, const KeychainSet& keychains, uint32_t unused_pool_size = 25, uint32_t time_created = time(NULL));
+    Account(const std::string& name, unsigned int minsigs, const KeychainSet& keychains, uint32_t unused_pool_size = DEFAULT_UNUSED_POOL_SIZE, uint32_t time_created = time(NULL));
 
     void updateHash();
 
@@ -420,6 +470,8 @@ private:
 
     uint32_t unused_pool_size_; // how many unused scripts we want in our lookahead
     uint32_t time_created_;
+
+    #pragma db unique
     bytes_t hash_; // ripemd160(sha256(data)) where data = concat(first byte(minsigs), keychain hash 1, keychain hash 2, ...) and keychain hashes are sorted lexically
 
     #pragma db value_not_null inverse(account_)
@@ -555,13 +607,13 @@ class BlockHeader
 public:
     BlockHeader() { }
 
-    BlockHeader(const Coin::CoinBlockHeader& blockheader, uint32_t height = 0xffffffff) { fromCoinClasses(blockheader, height); }
+    BlockHeader(const Coin::CoinBlockHeader& blockheader, uint32_t height = 0xffffffff) { fromCoinCore(blockheader, height); }
 
     BlockHeader(const bytes_t& hash, uint32_t height, uint32_t version, const bytes_t& prevhash, const bytes_t& merkleroot, uint32_t timestamp, uint32_t bits, uint32_t nonce)
     : hash_(hash), height_(height), version_(version), prevhash_(prevhash), merkleroot_(merkleroot), timestamp_(timestamp), bits_(bits), nonce_(nonce) { }
 
-    void fromCoinClasses(const Coin::CoinBlockHeader& blockheader, uint32_t height = 0xffffffff);
-    Coin::CoinBlockHeader toCoinClasses() const;
+    void fromCoinCore(const Coin::CoinBlockHeader& blockheader, uint32_t height = 0xffffffff);
+    Coin::CoinBlockHeader toCoinCore() const;
 
     unsigned long id() const { return id_; }
     bytes_t hash() const { return hash_; }
@@ -606,10 +658,10 @@ public:
     MerkleBlock(const std::shared_ptr<BlockHeader>& blockheader, uint32_t txcount, const std::vector<bytes_t>& hashes, const bytes_t& flags)
         : blockheader_(blockheader), txcount_(txcount), hashes_(hashes), flags_(flags) { }
 
-    MerkleBlock(const ChainMerkleBlock& merkleblock) { fromCoinClasses(merkleblock, merkleblock.height); }
+    MerkleBlock(const ChainMerkleBlock& merkleblock) { fromCoinCore(merkleblock, merkleblock.height); }
 
-    void fromCoinClasses(const Coin::MerkleBlock& merkleblock, uint32_t height = 0xffffffff);
-    Coin::MerkleBlock toCoinClasses() const;
+    void fromCoinCore(const Coin::MerkleBlock& merkleblock, uint32_t height = 0xffffffff);
+    Coin::MerkleBlock toCoinCore() const;
 
     unsigned long id() const { return id_; }
 
@@ -655,7 +707,7 @@ public:
     TxIn(const Coin::TxIn& coin_txin);
     TxIn(const bytes_t& raw);
 
-    Coin::TxIn toCoinClasses() const;
+    Coin::TxIn toCoinCore() const;
 
     unsigned long id() const { return id_; }
     const bytes_t& outhash() const { return outhash_; }
@@ -742,7 +794,7 @@ public:
     TxOut(const Coin::TxOut& coin_txout);
     TxOut(const bytes_t& raw);
 
-    Coin::TxOut toCoinClasses() const;
+    Coin::TxOut toCoinCore() const;
 
     unsigned long id() const { return id_; }
     uint64_t value() const { return value_; }
@@ -861,7 +913,7 @@ public:
     void set(Coin::Transaction coin_tx, uint32_t timestamp = 0xffffffff, status_t status = PROPAGATED);
     void set(const bytes_t& raw, uint32_t timestamp = 0xffffffff, status_t status = PROPAGATED);
 
-    Coin::Transaction toCoinClasses() const;
+    Coin::Transaction toCoinCore() const;
 
     void setBlock(std::shared_ptr<BlockHeader> blockheader, uint32_t blockindex);
 
@@ -899,7 +951,7 @@ public:
 private:
     friend class odb::access;
 
-    void fromCoinClasses(const Coin::Transaction& coin_tx);
+    void fromCoinCore(const Coin::Transaction& coin_tx);
 
     #pragma db id auto
     unsigned long id_;
@@ -1008,11 +1060,15 @@ struct AccountBinView
     unsigned long account_id;
     #pragma db column(Account::name_)
     std::string account_name;
+    #pragma db column(Account::hash_)
+    bytes_t account_hash;
 
     #pragma db column(AccountBin::id_)
     unsigned long bin_id; 
     #pragma db column(AccountBin::name_)
     std::string bin_name;
+    #pragma db column(AccountBin::hash_)
+    bytes_t bin_hash;
 };
 
 #pragma db view \
@@ -1060,6 +1116,9 @@ struct ScriptCountView
 {
     #pragma db column("count(" + SigningScript::id_ + ")")
     uint32_t count;
+
+    #pragma db column("max(" + SigningScript::index_ + ")")
+    unsigned long max_index;
 };
 
 const std::string EMPTY_STRING = "";
@@ -1299,5 +1358,13 @@ struct ConfirmedTxView
 };
 
 }
+
+BOOST_CLASS_VERSION(CoinDB::TxIn, 1)
+BOOST_CLASS_VERSION(CoinDB::TxOut, 1)
+BOOST_CLASS_VERSION(CoinDB::Tx, 1)
+
+BOOST_CLASS_VERSION(CoinDB::Keychain, 1)
+BOOST_CLASS_VERSION(CoinDB::AccountBin, 1)
+BOOST_CLASS_VERSION(CoinDB::Account, 1)
 
 #endif // COINDB_SCHEMA_H

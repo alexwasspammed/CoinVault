@@ -13,16 +13,19 @@
 #include "VaultExceptions.h"
 #include "SigningRequest.h"
 
-#include <CoinQ_signals.h>
-#include <CoinQ_slots.h>
-#include <CoinQ_blocks.h>
+#include <Signals/Signals.h>
 
-#include <BloomFilter.h>
+#include <CoinQ/CoinQ_blocks.h>
+
+#include <CoinCore/BloomFilter.h>
 
 #include <boost/thread.hpp>
 
 namespace CoinDB
 {
+
+typedef Signals::Signal<std::shared_ptr<Tx>> TxSignal;
+typedef Signals::Signal<std::shared_ptr<MerkleBlock>> MerkleBlockSignal;
 
 class Vault
 {
@@ -36,7 +39,10 @@ public:
     ///////////////////////
     // GLOBAL OPERATIONS //
     ///////////////////////
-    uint32_t                                MAX_HORIZON_TIMESTAMP_OFFSET = 6 * 60 * 60; // a good six hours initial tolerance for incorrect clock
+    uint32_t                                getSchemaVersion() const;
+    void                                    setSchemaVersion(uint32_t version);
+
+    static const uint32_t                   MAX_HORIZON_TIMESTAMP_OFFSET = 6 * 60 * 60; // a good six hours initial tolerance for incorrect clock
     uint32_t                                getHorizonTimestamp() const; // nothing that happened before this should matter to us.
     uint32_t                                getMaxFirstBlockTimestamp() const; // convenience method. getHorizonTimestamp() - MIN_HORIZON_TIMESTAMP_OFFSET
     uint32_t                                getHorizonHeight() const;
@@ -62,9 +68,10 @@ public:
     //void eraseKeychain(const std::string& keychain_name) const;
     void                                    renameKeychain(const std::string& old_name, const std::string& new_name);
     std::shared_ptr<Keychain>               getKeychain(const std::string& keychain_name) const;
-    std::vector<std::shared_ptr<Keychain>>  getAllKeychains(bool root_only = false) const;
-    std::vector<KeychainView>               getRootKeychainViews(const std::string& account_name = std::string()) const;
+    std::vector<std::shared_ptr<Keychain>>  getAllKeychains(bool root_only = false, bool get_hidden = false) const;
+    std::vector<KeychainView>               getRootKeychainViews(const std::string& account_name = "", bool get_hidden = false) const;
     secure_bytes_t                          getKeychainExtendedKey(const std::string& keychain_name, bool get_private) const;
+    std::shared_ptr<Keychain>               importKeychainExtendedKey(const std::string& keychain_name, const secure_bytes_t& extkey, bool try_private, const secure_bytes_t& lockKey = secure_bytes_t(), const bytes_t& salt = bytes_t());
 
     // The following private key lock/unlock methods do not maintain a database session open so they only
     // store and erase the unlock keys in a member map to be used by the other class methods.
@@ -96,18 +103,23 @@ public:
     ////////////////////////////
     // ACCOUNT BIN OPERATIONS //
     ////////////////////////////
-    std::shared_ptr<AccountBin> getAccountBin(const std::string& account_name, const std::string& bin_name) const;
+    std::shared_ptr<AccountBin>             getAccountBin(const std::string& account_name, const std::string& bin_name) const;
+    std::vector<AccountBinView>             getAllAccountBinViews() const;
+    void                                    exportAccountBin(const std::string& account_name, const std::string& bin_name, const std::string& export_name, const std::string& filepath, const secure_bytes_t& exportChainCodeUnlockKey = secure_bytes_t()) const;
+    std::shared_ptr<AccountBin>             importAccountBin(const std::string& filepath, const secure_bytes_t& importChainCodeUnlockKey = secure_bytes_t()); 
 
     ///////////////////
     // TX OPERATIONS //
     ///////////////////
-    std::shared_ptr<Tx>                     getTx(const bytes_t& hash) const; // Tries both signed and unsigned hashes. Throws TxNotFoundException/
+    std::shared_ptr<Tx>                     getTx(const bytes_t& hash) const; // Tries both signed and unsigned hashes. Throws TxNotFoundException.
+    std::shared_ptr<Tx>                     getTx(unsigned long tx_id) const; // Uses the database id. Throws TxNotFoundException.
     std::shared_ptr<Tx>                     insertTx(std::shared_ptr<Tx> tx); // Inserts transaction only if it affects one of our accounts. Returns transaction in vault if change occured. Otherwise returns nullptr.
     std::shared_ptr<Tx>                     createTx(const std::string& account_name, uint32_t tx_version, uint32_t tx_locktime, txouts_t txouts, uint64_t fee, unsigned int maxchangeouts = 1, bool insert = false);
     void                                    deleteTx(const bytes_t& tx_hash); // Tries both signed and unsigned hashes. Throws TxNotFoundException.
     SigningRequest                          getSigningRequest(const bytes_t& unsigned_hash, bool include_raw_tx = false) const; // Tries only unsigned hashes. Throws TxNotFoundException.
     // signTx tries only unsigned hashes for named keychains. If no keychains are named, tries all keychains. Throws TxNotFoundException.
     std::shared_ptr<Tx>                     signTx(const bytes_t& unsigned_hash, std::vector<std::string>& keychain_names, bool update = false);
+    std::shared_ptr<Tx>                     signTx(unsigned long tx_id, std::vector<std::string>& keychain_names, bool update = false);
 
     //////////////////////
     // BLOCK OPERATIONS //
@@ -120,10 +132,26 @@ public:
     unsigned int                            deleteMerkleBlock(const bytes_t& hash);
     unsigned int                            deleteMerkleBlock(uint32_t height);
 
+    ////////////////////////
+    // SLOT SUBSCRIPTIONS //
+    ////////////////////////
+    Signals::Connection subscribeTxInserted(TxSignal::Slot slot) { return notifyTxInserted.connect(slot); }
+    Signals::Connection subscribeTxStatusChanged(TxSignal::Slot slot) { return notifyTxStatusChanged.connect(slot); }
+    Signals::Connection subscribeMerkleBlockInserted(MerkleBlockSignal::Slot slot) { return notifyMerkleBlockInserted.connect(slot); }
+    void clearAllSlots()
+    {
+        notifyTxInserted.clear();
+        notifyTxStatusChanged.clear();
+        notifyMerkleBlockInserted.clear();
+    }
+
 protected:
     ///////////////////////
     // GLOBAL OPERATIONS //
     ///////////////////////
+    uint32_t                                getSchemaVersion_unwrapped() const;
+    void                                    setSchemaVersion_unwrapped(uint32_t version);
+
     uint32_t                                getHorizonTimestamp_unwrapped() const;
     uint32_t                                getMaxFirstBlockTimestamp_unwrapped() const;
     uint32_t                                getHorizonHeight_unwrapped() const;
@@ -146,7 +174,7 @@ protected:
     void                                    exportKeychain_unwrapped(std::shared_ptr<Keychain> keychain, const std::string& filepath, const secure_bytes_t& exportChainCodeUnlockKey = secure_bytes_t()) const;
     std::shared_ptr<Keychain>               importKeychain_unwrapped(const std::string& filepath, bool& importprivkeys, const secure_bytes_t& importChainCodeUnlockKey = secure_bytes_t());
     secure_bytes_t                          getKeychainExtendedKey_unwrapped(std::shared_ptr<Keychain> keychain, bool get_private) const;
-    std::vector<KeychainView>               getRootKeychainViews_unwrapped(std::shared_ptr<Account> account = nullptr) const;
+    std::vector<KeychainView>               getRootKeychainViews_unwrapped(const std::string& account_name = "", bool get_hidden = false) const;
 
     // All the keychain unlock methods use the global keys by default
 
@@ -182,12 +210,16 @@ protected:
     ////////////////////////////
     std::shared_ptr<AccountBin>             getAccountBin_unwrapped(const std::string& account_name, const std::string& bin_name) const;
     std::shared_ptr<SigningScript>          issueAccountBinSigningScript_unwrapped(std::shared_ptr<AccountBin> account_bin, const std::string& label = "");
+    void                                    unlockAccountBinChainCodes_unwrapped(std::shared_ptr<AccountBin> bin, const secure_bytes_t& overrideChainCodeUnlockKey = secure_bytes_t()) const;
     void                                    refillAccountBinPool_unwrapped(std::shared_ptr<AccountBin> bin);
+    void                                    exportAccountBin_unwrapped(const std::shared_ptr<AccountBin> account_bin, const std::string& export_name, const std::string& filepath, const secure_bytes_t& exportChainCodeUnlockKey = secure_bytes_t()) const;
+    std::shared_ptr<AccountBin>             importAccountBin_unwrapped(const std::string& filepath, const secure_bytes_t& importChainCodeUnlockKey = secure_bytes_t()); 
 
     ///////////////////
     // TX OPERATIONS //
     ///////////////////
-    std::shared_ptr<Tx>                     getTx_unwrapped(const bytes_t& hash) const; // Tries both signed and unsigned hashes. Throws TxNotFoundException/
+    std::shared_ptr<Tx>                     getTx_unwrapped(const bytes_t& hash) const; // Tries both signed and unsigned hashes. Throws TxNotFoundException.
+    std::shared_ptr<Tx>                     getTx_unwrapped(unsigned long tx_id) const; // Uses database id. Throws TxNotFoundException.
     std::shared_ptr<Tx>                     insertTx_unwrapped(std::shared_ptr<Tx> tx);
     std::shared_ptr<Tx>                     createTx_unwrapped(const std::string& account_name, uint32_t tx_version, uint32_t tx_locktime, txouts_t txouts, uint64_t fee, unsigned int maxchangeouts = 1);
     void                                    deleteTx_unwrapped(std::shared_ptr<Tx> tx);
@@ -207,6 +239,14 @@ protected:
     unsigned int                            deleteMerkleBlock_unwrapped(uint32_t height);
     unsigned int                            updateConfirmations_unwrapped(std::shared_ptr<Tx> tx = nullptr); // If parameter is null, updates all unconfirmed transactions.
                                                                                                      // Returns the number of transaction previously unconfirmed that are now confirmed.
+
+    /////////////
+    // SIGNALS //
+    /////////////
+    TxSignal                                notifyTxInserted;
+    TxSignal                                notifyTxStatusChanged;
+    MerkleBlockSignal                       notifyMerkleBlockInserted;
+
 private:
     mutable boost::mutex mutex;
     std::shared_ptr<odb::core::database> db_;

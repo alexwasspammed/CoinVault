@@ -13,10 +13,10 @@
 
 #include "accountmodel.h"
 
-#include <CoinQ_script.h>
-#include <CoinQ_netsync.h>
+#include <CoinQ/CoinQ_script.h>
+#include <CoinQ/CoinQ_netsync.h>
 
-#include <random.h>
+#include <CoinCore/random.h>
 
 #include <stdutils/stringutils.h>
 
@@ -283,7 +283,7 @@ Coin::Transaction AccountModel::createTx(const QString& accountName, const std::
 
     std::shared_ptr<Tx> tx = vault->createTx(accountName.toStdString(), 1, 0, txouts, fee,  1);
     update();
-    return tx->toCoinClasses();
+    return tx->toCoinCore();
 }
 
 bytes_t AccountModel::signRawTx(const bytes_t& rawTx)

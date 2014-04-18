@@ -8,21 +8,23 @@
 //
 
 #include "Vault.h"
-
-#include <CoinQ_script.h>
-#include <CoinQ_blocks.h>
-
 #include "Database.h"
+
+#include <CoinQ/CoinQ_script.h>
+#include <CoinQ/CoinQ_blocks.h>
+
 
 #include "../odb/Schema-odb.hxx"
 
 #include <odb/transaction.hxx>
 #include <odb/session.hxx>
 
-#include <hash.h>
-#include <MerkleTree.h>
-#include <secp256k1.h>
-#include <BigInt.h>
+#include <CoinCore/hash.h>
+#include <CoinCore/MerkleTree.h>
+#include <CoinCore/secp256k1.h>
+#include <CoinCore/BigInt.h>
+
+#include <logger/logger.h>
 
 #include <stdutils/stringutils.h>
 
@@ -30,13 +32,9 @@
 #include <fstream>
 #include <algorithm>
 
-#include <logger.h>
-
 // support for boost serialization
 #include <boost/archive/text_oarchive.hpp>
 #include <boost/archive/text_iarchive.hpp>
-
-const std::size_t MAXSQLCLAUSES = 500;
 
 using namespace CoinDB;
 
@@ -46,24 +44,65 @@ using namespace CoinDB;
 Vault::Vault(int argc, char** argv, bool create, uint32_t version)
     : db_(open_database(argc, argv, create))
 {
-    LOGGER(trace) << "Opened Vault" << std::endl;
+    LOGGER(trace) << "Vault::Vault(..., " << (create ? "true" : "false") << ", " << version << ")" << std::endl;
 
-//    if (create) setVersion(version);
+    if (create) setSchemaVersion(version);
 }
 
 #if defined(DATABASE_SQLITE)
 Vault::Vault(const std::string& filename, bool create, uint32_t version)
     : db_(openDatabase(filename, create))
 {
-    LOGGER(trace) << "Opened Vault - filename: " << filename << " create: " << (create ? "true" : "false") << " version: " << version << std::endl;
+    LOGGER(trace) << "Vault::Vault(" << filename << ", " << (create ? "true" : "false") << ", " << version << ")" << std::endl;
 
-//    if (create) setVersion(version);
+    if (create) setSchemaVersion(version);
 }
 #endif
 
 ///////////////////////
 // GLOBAL OPERATIONS //
 ///////////////////////
+uint32_t Vault::getSchemaVersion() const
+{
+    LOGGER(trace) << "Vault::getSchemaVersion()" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::transaction t(db_->begin());
+    return getSchemaVersion_unwrapped();
+}
+
+uint32_t Vault::getSchemaVersion_unwrapped() const
+{
+    odb::result<Version> r(db_->query<Version>());
+    return r.empty() ? 0 : r.begin()->version();
+}
+
+void Vault::setSchemaVersion(uint32_t version)
+{
+    LOGGER(trace) << "Vault::setSchemaVersion(" << version << ")" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::transaction t(db_->begin());
+    setSchemaVersion_unwrapped(version);
+    t.commit();
+}
+
+void Vault::setSchemaVersion_unwrapped(uint32_t version)
+{
+    odb::result<Version> r(db_->query<Version>());
+    if (r.empty())
+    {
+        std::shared_ptr<Version> version_obj(new Version(version));
+        db_->persist(version_obj);
+    }
+    else
+    {
+        std::shared_ptr<Version> version_obj(r.begin().load());
+        version_obj->version(version);
+        db_->update(version_obj);
+    }
+}
+
 uint32_t Vault::getHorizonTimestamp() const
 {
     LOGGER(trace) << "Vault::getHorizonTimestamp()" << std::endl;
@@ -406,17 +445,23 @@ void Vault::persistKeychain_unwrapped(std::shared_ptr<Keychain> keychain)
     db_->persist(keychain);
 }
 
-std::vector<KeychainView> Vault::getRootKeychainViews(const std::string& account_name) const
+std::vector<KeychainView> Vault::getRootKeychainViews(const std::string& account_name, bool get_hidden) const
 {
-    LOGGER(trace) << "Vault::getRootKeychainViews(" << account_name << ")" << std::endl;
+    LOGGER(trace) << "Vault::getRootKeychainViews(" << account_name << ", " << (get_hidden ? "true" : "false") << ")" << std::endl;
 
     boost::lock_guard<boost::mutex> lock(mutex);
     odb::core::transaction t(db_->begin());
+    return getRootKeychainViews_unwrapped(account_name, get_hidden);
+}
 
+std::vector<KeychainView> Vault::getRootKeychainViews_unwrapped(const std::string& account_name, bool get_hidden) const
+{
     typedef odb::query<KeychainView> query_t;
     query_t query(1 == 1);
     if (!account_name.empty())
         query = query && (query_t::Account::name == account_name);
+    if (getSchemaVersion_unwrapped() >= 4 && !get_hidden)
+        query = query && (!query_t::Keychain::hidden);
     odb::result<KeychainView> r(db_->query<KeychainView>(query));
     std::vector<KeychainView> views;
     for (auto& view: r)
@@ -427,14 +472,9 @@ std::vector<KeychainView> Vault::getRootKeychainViews(const std::string& account
     return views;
 }
 
-std::vector<KeychainView> Vault::getRootKeychainViews_unwrapped(std::shared_ptr<Account> account) const
-{
-    return std::vector<KeychainView>();
-}
-
 secure_bytes_t Vault::getKeychainExtendedKey(const std::string& keychain_name, bool get_private) const
 {
-    LOGGER(debug) << "Vault::getKeychainExtendedKey(" << keychain_name << ", " << (get_private ? "true" : "false") << ")" << std::endl;
+    LOGGER(trace) << "Vault::getKeychainExtendedKey(" << keychain_name << ", " << (get_private ? "true" : "false") << ")" << std::endl;
 
     boost::lock_guard<boost::mutex> lock(mutex);
     odb::core::transaction t(db_->begin());
@@ -450,23 +490,32 @@ secure_bytes_t Vault::getKeychainExtendedKey_unwrapped(std::shared_ptr<Keychain>
     return keychain->extkey(get_private);
 }
 
+std::shared_ptr<Keychain> Vault::importKeychainExtendedKey(const std::string& keychain_name, const secure_bytes_t& extkey, bool try_private, const secure_bytes_t& lockKey, const bytes_t& salt)
+{
+    LOGGER(trace) << "Vault::importKeychainExtendedKey(" << keychain_name << ", ...)" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::session session;
+    odb::core::transaction t(db_->begin());
+    odb::result<Keychain> r(db_->query<Keychain>(odb::query<Keychain>::name == keychain_name));
+    if (!r.empty()) throw KeychainAlreadyExistsException(keychain_name);
+
+    std::shared_ptr<Keychain> keychain(new Keychain(keychain_name, secure_bytes_t()));
+    keychain->extkey(extkey, try_private, lockKey, salt);
+    keychain->setChainCodeUnlockKey(chainCodeUnlockKey);
+    persistKeychain_unwrapped(keychain);
+    t.commit();
+
+    return keychain;
+}
+
 void Vault::unlockAccountChainCodes_unwrapped(std::shared_ptr<Account> account, const secure_bytes_t& overrideChainCodeUnlockKey) const
 {
     for (auto& keychain: account->keychains())
     {
-        if (!keychain->unlockChainCode(chainCodeUnlockKey))
+        if (!keychain->unlockChainCode(overrideChainCodeUnlockKey.empty() ? chainCodeUnlockKey : overrideChainCodeUnlockKey))
             throw KeychainChainCodeUnlockFailedException(keychain->name());
     }
-}
-
-bool Vault::tryUnlockAccountChainCodes_unwrapped(std::shared_ptr<Account> account, const secure_bytes_t& overrideChainCodeUnlockKey) const
-{
-    for (auto& keychain: account->keychains())
-    {
-        if (!keychain->unlockChainCode(chainCodeUnlockKey))
-            return false;
-    }
-    return true;
 }
 
 void Vault::refillAccountPool(const std::string& account_name)
@@ -504,17 +553,17 @@ std::shared_ptr<Keychain> Vault::getKeychain_unwrapped(const std::string& keycha
     return keychain;
 }
 
-std::vector<std::shared_ptr<Keychain>> Vault::getAllKeychains(bool root_only) const
+std::vector<std::shared_ptr<Keychain>> Vault::getAllKeychains(bool root_only, bool get_hidden) const
 {
     LOGGER(trace) << "Vault::getAllKeychains()" << std::endl;
 
     boost::lock_guard<boost::mutex> lock(mutex);
     odb::core::transaction t(db_->begin());
-    odb::result<Keychain> r;
-    if (root_only)
-        r = db_->query<Keychain>(odb::query<Keychain>::parent.is_null());
-    else
-        r = db_->query<Keychain>();
+    odb::query<Keychain> query(1 == 1);
+    if (root_only)     { query = query && odb::query<Keychain>::parent.is_null();  }
+    if (getSchemaVersion_unwrapped() >= 4 && !get_hidden)
+        query = query && !odb::query<Keychain>::hidden;
+    odb::result<Keychain> r(db_->query<Keychain>(query));
 
     std::vector<std::shared_ptr<Keychain>> keychains;
     for (auto& keychain: r) { keychains.push_back(keychain.get_shared_ptr()); }
@@ -719,7 +768,6 @@ std::shared_ptr<Account> Vault::importAccount_unwrapped(const std::string& filep
                 ss << keychain_name << append_num++;
                 keychain->name(ss.str());
             }
-
             db_->persist(keychain);
         }
         else
@@ -744,17 +792,17 @@ std::shared_ptr<Account> Vault::importAccount_unwrapped(const std::string& filep
     // Create signing scripts and keys and persist account bins
     for (auto& bin: account->bins())
     {
+        bin->makeImport();
         db_->persist(bin);
 
         SigningScript::status_t status = bin->isChange() ? SigningScript::CHANGE : SigningScript::ISSUED;
         unsigned int next_script_index = bin->next_script_index();
         for (unsigned int i = 0; i < next_script_index; i++)
         {
-            // TODO: SigningScript labels
             std::shared_ptr<SigningScript> script = bin->newSigningScript();
             script->status(status);
             for (auto& key: script->keys()) { db_->persist(key); }
-            db_->persist(script); 
+            db_->persist(script);
         }
         for (unsigned int i = 0; i < account->unused_pool_size(); i++)
         {
@@ -804,7 +852,9 @@ void Vault::newAccount(const std::string& account_name, unsigned int minsigs, co
     }
 
     std::shared_ptr<Account> account(new Account(account_name, minsigs, keychains, unused_pool_size, time_created));
-    tryUnlockAccountChainCodes_unwrapped(account);
+    r = db_->query<Account>(odb::query<Account>::hash == account->hash());
+    if (!r.empty()) throw AccountAlreadyExistsException(account->name());
+    unlockAccountChainCodes_unwrapped(account);
     db_->persist(account);
 
     // The first bin we create must be the change bin.
@@ -939,7 +989,7 @@ std::shared_ptr<AccountBin> Vault::addAccountBin(const std::string& account_name
     if (binExists) throw AccountBinAlreadyExistsException(account_name, bin_name);
 
     std::shared_ptr<Account> account = getAccount_unwrapped(account_name);
-    tryUnlockAccountChainCodes_unwrapped(account);
+    unlockAccountChainCodes_unwrapped(account);
 
     std::shared_ptr<AccountBin> bin = account->addBin(bin_name);
     db_->persist(bin);
@@ -965,7 +1015,7 @@ std::shared_ptr<SigningScript> Vault::issueSigningScript(const std::string& acco
     odb::core::session s;
     odb::core::transaction t(db_->begin());
     std::shared_ptr<AccountBin> bin = getAccountBin_unwrapped(account_name, bin_name);
-    if (bin->isChange()) throw AccountCannotIssueChangeScriptException(bin->account()->name());
+    if (bin->isChange()) throw AccountCannotIssueChangeScriptException(account_name);
     std::shared_ptr<SigningScript> script = issueAccountBinSigningScript_unwrapped(bin, label);
     t.commit();
     return script;
@@ -973,13 +1023,15 @@ std::shared_ptr<SigningScript> Vault::issueSigningScript(const std::string& acco
 
 std::shared_ptr<SigningScript> Vault::issueAccountBinSigningScript_unwrapped(std::shared_ptr<AccountBin> bin, const std::string& label)
 {
+    bool refill = false;
     try
     {
         refillAccountBinPool_unwrapped(bin);
+        refill = true;
     }
     catch (const KeychainChainCodeLockedException& e)
     {
-        LOGGER(debug) << "Vault::issueAccountBinSigningScript_unwrapped(" << bin->account()->name() << "::" << bin->name() << ", " << label << ") - Chain code is locked so pool cannot be replenished." << std::endl;
+        LOGGER(debug) << "Vault::issueAccountBinSigningScript_unwrapped(" << bin->account_name() << "::" << bin->name() << ", " << label << ") - Chain code is locked so pool cannot be replenished." << std::endl;
     }
 
     // Get the next available unused signing script
@@ -987,7 +1039,7 @@ std::shared_ptr<SigningScript> Vault::issueAccountBinSigningScript_unwrapped(std
     odb::result<SigningScriptView> view_result(db_->query<SigningScriptView>(
         (view_query::AccountBin::id == bin->id() && view_query::SigningScript::status == SigningScript::UNUSED) +
         "ORDER BY" + view_query::SigningScript::index + "LIMIT 1"));
-    if (view_result.empty()) throw AccountBinOutOfScriptsException(bin->account()->name(), bin->name());
+    if (view_result.empty()) throw AccountBinOutOfScriptsException(bin->account_name(), bin->name());
 
     std::shared_ptr<SigningScriptView> view(view_result.begin().load());
 
@@ -997,19 +1049,56 @@ std::shared_ptr<SigningScript> Vault::issueAccountBinSigningScript_unwrapped(std
     script->label(label);
     script->status(SigningScript::ISSUED);
     db_->update(script);
-    db_->update(script->account_bin());
+    bin->markSigningScriptIssued(script->index());
+    db_->update(bin);
+    if (refill) { refillAccountBinPool_unwrapped(bin); }
     return script;
+}
+
+void Vault::unlockAccountBinChainCodes_unwrapped(std::shared_ptr<AccountBin> bin, const secure_bytes_t& overrideChainCodeUnlockKey) const
+{
+    if (bin->account())
+    {
+        unlockAccountChainCodes_unwrapped(bin->account(), overrideChainCodeUnlockKey.empty() ? chainCodeUnlockKey : overrideChainCodeUnlockKey);
+    }
+    else
+    {
+        for (auto& keychain: bin->keychains())
+        {
+            if (!keychain->unlockChainCode(overrideChainCodeUnlockKey.empty() ? chainCodeUnlockKey : overrideChainCodeUnlockKey))
+                throw KeychainChainCodeUnlockFailedException(keychain->name());
+        }
+    }
 }
 
 void Vault::refillAccountBinPool_unwrapped(std::shared_ptr<AccountBin> bin)
 {
-    tryUnlockAccountChainCodes_unwrapped(bin->account());
+    unlockAccountBinChainCodes_unwrapped(bin);
 
-    typedef odb::query<ScriptCountView> count_query;
-    odb::result<ScriptCountView> count_result(db_->query<ScriptCountView>(count_query::AccountBin::id == bin->id() && count_query::SigningScript::status == SigningScript::UNUSED));
+    // get largest signing script index that is not unused
+    typedef odb::query<ScriptCountView> count_query_t;
+    odb::result<ScriptCountView> count_result(db_->query<ScriptCountView>(count_query_t::AccountBin::id == bin->id() && count_query_t::SigningScript::status != SigningScript::UNUSED));
+    unsigned long max_index = count_result.empty() ? 0 : count_result.begin()->max_index;
+
+    if (max_index > 0)
+    {
+        // update any unused signing scripts with smaller index to issued status
+        typedef odb::query<SigningScriptView> script_query_t;
+        odb::result<SigningScriptView> script_result(db_->query<SigningScriptView>(script_query_t::AccountBin::id == bin->id() &&
+            script_query_t::SigningScript::status == SigningScript::UNUSED && script_query_t::SigningScript::index < max_index));
+        for (auto& script_view: script_result)
+        {
+            std::shared_ptr<SigningScript> script(db_->load<SigningScript>(script_view.id));
+            script->status(SigningScript::ISSUED);
+            db_->update(script);
+        }
+    }
+
+    // refill remaining pool
+    count_result = db_->query<ScriptCountView>(count_query_t::AccountBin::id == bin->id() && count_query_t::SigningScript::status == SigningScript::UNUSED);
     uint32_t count = count_result.empty() ? 0 : count_result.begin().load()->count;
 
-    uint32_t unused_pool_size = bin->account()->unused_pool_size();
+    uint32_t unused_pool_size = bin->account() ? bin->account()->unused_pool_size() : DEFAULT_UNUSED_POOL_SIZE;
     for (uint32_t i = count; i < unused_pool_size; i++)
     {
         std::shared_ptr<SigningScript> script = bin->newSigningScript();
@@ -1098,12 +1187,162 @@ std::shared_ptr<AccountBin> Vault::getAccountBin(const std::string& account_name
 
 std::shared_ptr<AccountBin> Vault::getAccountBin_unwrapped(const std::string& account_name, const std::string& bin_name) const
 {
-    typedef odb::query<AccountBinView> query;
-    odb::result<AccountBinView> r(db_->query<AccountBinView>(query::Account::name == account_name && query::AccountBin::name == bin_name));
+    typedef odb::query<AccountBin> query_t;
+    query_t query(query_t::name == bin_name);
+    if (account_name.empty())   { query = query && query_t::account.is_null();              }
+    else                        { query = query && query_t::account->name == account_name;  }
+    odb::result<AccountBin> r(db_->query<AccountBin>(query));
     if (r.empty()) throw AccountBinNotFoundException(account_name, bin_name);
+    return r.begin().load();
+}
 
-    unsigned long bin_id = r.begin().load()->bin_id;
-    std::shared_ptr<AccountBin> bin(db_->load<AccountBin>(bin_id));
+std::vector<AccountBinView> Vault::getAllAccountBinViews() const
+{
+    LOGGER(trace) << "Vault::getAllAccountBinViews()" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::transaction t(db_->begin());
+    odb::result<AccountBinView> r(db_->query<AccountBinView>());
+    std::vector<AccountBinView> views;
+    for (auto& view: r) { views.push_back(view); }
+    return views; 
+}
+
+void Vault::exportAccountBin(const std::string& account_name, const std::string& bin_name, const std::string& export_name, const std::string& filepath, const secure_bytes_t& exportChainCodeUnlockKey) const
+{
+    LOGGER(trace) << "Vault::exportAccountBin(" << account_name << ", " << bin_name << ", " << filepath << ", ?)" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::session s;
+    odb::core::transaction t(db_->begin());
+    std::shared_ptr<AccountBin> bin = getAccountBin_unwrapped(account_name, bin_name);
+    exportAccountBin_unwrapped(bin, export_name, filepath, exportChainCodeUnlockKey);
+}
+
+void Vault::exportAccountBin_unwrapped(const std::shared_ptr<AccountBin> account_bin, const std::string& export_name, const std::string& filepath, const secure_bytes_t& exportChainCodeUnlockKey) const
+{
+    unlockAccountBinChainCodes_unwrapped(account_bin);
+    
+    account_bin->makeExport(export_name);
+
+    // Reencrypt the chain codes
+    for (auto& keychain: account_bin->keychains())
+    {
+        keychain->setChainCodeUnlockKey(exportChainCodeUnlockKey.empty() ? chainCodeUnlockKey : exportChainCodeUnlockKey);
+    }
+
+    std::ofstream ofs(filepath);
+    boost::archive::text_oarchive oa(ofs);
+    oa << *account_bin;
+}
+
+std::shared_ptr<AccountBin> Vault::importAccountBin(const std::string& filepath, const secure_bytes_t& importChainCodeUnlockKey)
+{
+    LOGGER(trace) << "Vault::importAccountBin(" << filepath << ", ?)" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::session s;
+    odb::core::transaction t(db_->begin());
+    std::shared_ptr<AccountBin> bin = importAccountBin_unwrapped(filepath, importChainCodeUnlockKey);
+    t.commit();
+    return bin;
+}
+
+std::shared_ptr<AccountBin> Vault::importAccountBin_unwrapped(const std::string& filepath, const secure_bytes_t& importChainCodeUnlockKey)
+{
+    std::shared_ptr<AccountBin> bin(new AccountBin());
+    {
+        std::ifstream ifs(filepath);
+        boost::archive::text_iarchive ia(ifs);
+        ia >> *bin;
+    }
+    bin->updateHash();
+
+    odb::result<AccountBin> r(db_->query<AccountBin>(odb::query<AccountBin>::hash == bin->hash()));
+    if (!r.empty())
+    {
+        std::shared_ptr<AccountBin> bin(r.begin().load());
+        throw AccountBinAlreadyExistsException(bin->account_name(), bin->name());
+    }
+
+    // In case of bin name conflict
+    // TODO: detect account bin duplicates.
+    std::string bin_name = bin->name();
+    unsigned int append_num = 1;
+    while (true)
+    {
+        odb::result<AccountBin> r(db_->query<AccountBin>(odb::query<AccountBin>::name == bin->name()));
+        if (r.empty()) break;
+
+        std::stringstream ss;
+        ss << bin_name << append_num++;
+        bin->name(ss.str());
+    }
+
+    // Persist keychains
+    std::string keychain_base_name = bin->name();
+    unsigned int keychain_append_num = 1;
+    auto& loaded_keychains = bin->keychains();
+    KeychainSet stored_keychains; // We will replace any duplicate loaded keychains with keychains already in database.
+    for (auto& keychain: loaded_keychains)
+    {
+        odb::result<Keychain> r(db_->query<Keychain>(odb::query<Keychain>::hash == keychain->hash()));
+        if (r.empty())
+        {
+            // We do not have this keychain. Import it.
+            if (importChainCodeUnlockKey.empty())
+            {
+                unlockKeychainChainCode_unwrapped(keychain);
+            }
+            else
+            {
+                // Reencrypt the chain code using our own unlock key.
+                unlockKeychainChainCode_unwrapped(keychain, importChainCodeUnlockKey);
+                keychain->setChainCodeUnlockKey(chainCodeUnlockKey);
+            }
+
+            do
+            {
+                std::stringstream ss;
+                ss << keychain_base_name << "(" << keychain_append_num++ << ")";
+                keychain->name(ss.str());
+            }
+            while (keychainExists_unwrapped(keychain->name()));
+
+            keychain->hidden(true); // Do not display this keychain in UI.
+            db_->persist(keychain);
+            stored_keychains.insert(keychain);
+        }
+        else
+        {
+            // We already have this keychain. Just replace the loaded one with the stored one.
+            std::shared_ptr<Keychain> stored_keychain(r.begin().load());
+            unlockKeychainChainCode_unwrapped(stored_keychain);
+            stored_keychains.insert(stored_keychain);
+        }
+    }
+
+    bin->keychains(stored_keychains); // Replace loaded keychains with stored keychains.
+
+    // Create signing scripts and keys and persist account bin
+    db_->persist(bin);
+
+    unsigned int next_script_index = bin->next_script_index();
+    for (unsigned int i = 0; i < next_script_index; i++)
+    {
+        std::shared_ptr<SigningScript> script = bin->newSigningScript();
+        script->status(SigningScript::ISSUED);
+        for (auto& key: script->keys()) { db_->persist(key); }
+        db_->persist(script);
+    }
+    for (unsigned int i = 0; i < DEFAULT_UNUSED_POOL_SIZE; i++)
+    {
+        std::shared_ptr<SigningScript> script = bin->newSigningScript();
+        for (auto& key: script->keys()) { db_->persist(key); }
+        db_->persist(script);
+    }
+    db_->update(bin);
+    
     return bin;
 }
 
@@ -1125,6 +1364,25 @@ std::shared_ptr<Tx> Vault::getTx_unwrapped(const bytes_t& hash) const
 {
     odb::result<Tx> r(db_->query<Tx>(odb::query<Tx>::hash == hash || odb::query<Tx>::unsigned_hash == hash));
     if (r.empty()) throw TxNotFoundException(hash);
+
+    std::shared_ptr<Tx> tx(r.begin().load());
+    return tx;
+}
+
+std::shared_ptr<Tx> Vault::getTx(unsigned long tx_id) const
+{
+    LOGGER(trace) << "Vault::getTx(" << tx_id << ")" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::session s;
+    odb::core::transaction t(db_->begin());
+    return getTx_unwrapped(tx_id);
+}
+
+std::shared_ptr<Tx> Vault::getTx_unwrapped(unsigned long tx_id) const
+{
+    odb::result<Tx> r(db_->query<Tx>(odb::query<Tx>::id == tx_id));
+    if (r.empty()) throw TxNotFoundException();
 
     std::shared_ptr<Tx> tx(r.begin().load());
     return tx;
@@ -1171,6 +1429,7 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
                 }
                 stored_tx->updateStatus(tx->status());
                 db_->update(stored_tx);
+                notifyTxStatusChanged(stored_tx);
                 return stored_tx;
             }
             else
@@ -1194,6 +1453,7 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
                     }
                     i++;
                 }
+                if (updated) notifyTxStatusChanged(stored_tx);
                 return updated ? stored_tx : nullptr;
             }
         }
@@ -1207,6 +1467,7 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
                     LOGGER(debug) << "Vault::insertTx_unwrapped - UPDATING TRANSACTION STATUS FROM " << stored_tx->status() << " TO " << tx->status() << ". hash: " << uchar_vector(stored_tx->hash()).getHex() << std::endl;
                     stored_tx->updateStatus(tx->status());
                     db_->update(stored_tx);
+                    notifyTxStatusChanged(stored_tx);
                     return stored_tx;
                 }
                 else
@@ -1280,10 +1541,6 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
         }
     }
 
-    // Stored for later update
-    std::set<std::shared_ptr<SigningScript>> scripts;
-    std::set<std::shared_ptr<AccountBin>> account_bins;
-
     // Check outputs
     bool sent_to_vault = false; // whether any of the outputs are spendable by accounts in vault
     uint64_t output_total = 0;
@@ -1315,8 +1572,7 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
                 {
                     script->status(SigningScript::USED);
                 }
-                scripts.insert(script);
-                account_bins.insert(script->account_bin());
+                db_->update(script);
                 try
                 {
                     refillAccountBinPool_unwrapped(script->account_bin());
@@ -1329,7 +1585,7 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
 
             case SigningScript::ISSUED:
                 script->status(SigningScript::USED);
-                scripts.insert(script);
+                db_->update(script);
                 break;
 
             default:
@@ -1351,10 +1607,11 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
         tx->updateStatus(Tx::CONFLICTING);
         for (auto& conflicting_tx: conflicting_txs)
         {
-            if (conflicting_tx->status() != Tx::CONFIRMED)
+            if (conflicting_tx->status() != Tx::CONFIRMED && conflicting_tx->status() != Tx::CONFLICTING)
             {
                 conflicting_tx->updateStatus(Tx::CONFLICTING);
                 db_->update(conflicting_tx);
+                notifyTxStatusChanged(conflicting_tx);
             }
         }
     }
@@ -1369,12 +1626,11 @@ std::shared_ptr<Tx> Vault::insertTx_unwrapped(std::shared_ptr<Tx> tx)
         for (auto& txin:        tx->txins())    { db_->persist(txin);       }
         for (auto& txout:       tx->txouts())   { db_->persist(txout);      }
 
-        // Update other affected objects
-        for (auto& script:      scripts)        { db_->update(script);      }
-        for (auto& account_bin: account_bins)   { db_->update(account_bin); }
+        // Update other affected txouts
         for (auto& txout:       updated_txouts) { db_->update(txout);       }
 
         if (tx->status() >= Tx::SENT) updateConfirmations_unwrapped(tx);
+        notifyTxInserted(tx);
         return tx;
     }
 
@@ -1553,6 +1809,27 @@ std::shared_ptr<Tx> Vault::signTx(const bytes_t& unsigned_hash, std::vector<std:
     return sigcount ? tx : nullptr;
 }
 
+std::shared_ptr<Tx> Vault::signTx(unsigned long tx_id, std::vector<std::string>& keychain_names, bool update)
+{
+    LOGGER(trace) << "Vault::signTx(" << tx_id << ", [" << stdutils::delimited_list(keychain_names, ", ") << "], " << (update ? "update" : "no update") << ")" << std::endl;
+
+    boost::lock_guard<boost::mutex> lock(mutex);
+    odb::core::session s;
+    odb::core::transaction t(db_->begin());
+
+    odb::result<Tx> tx_r(db_->query<Tx>(odb::query<Tx>::id == tx_id));
+    if (tx_r.empty()) throw TxNotFoundException();
+    std::shared_ptr<Tx> tx(tx_r.begin().load());
+
+    unsigned int sigcount = signTx_unwrapped(tx, keychain_names);
+    if (sigcount && update)
+    {
+        updateTx_unwrapped(tx);
+        t.commit();
+    }
+    return sigcount ? tx : nullptr;
+}
+
 unsigned int Vault::signTx_unwrapped(std::shared_ptr<Tx> tx, std::vector<std::string>& keychain_names)
 {
     using namespace CoinQ::Script;
@@ -1581,7 +1858,7 @@ unsigned int Vault::signTx_unwrapped(std::shared_ptr<Tx> tx, std::vector<std::st
         if (key_r.empty()) continue;
 
         // Prepare the inputs for hashing
-        Coin::Transaction coin_tx = tx->toCoinClasses();
+        Coin::Transaction coin_tx = tx->toCoinCore();
         unsigned int i = 0;
         for (auto& coin_input: coin_tx.inputs)
         {
@@ -1746,6 +2023,7 @@ std::shared_ptr<MerkleBlock> Vault::insertMerkleBlock_unwrapped(std::shared_ptr<
         LOGGER(debug) << "Vault::insertMerkleBlock_unwrapped - inserting horizon merkle block. hash: " << new_blockheader_hash << ", height: " << new_blockheader->height() << std::endl;
         db_->persist(new_blockheader);
         db_->persist(merkleblock);
+        notifyMerkleBlockInserted(merkleblock);
         return merkleblock;
     }
 
@@ -1783,6 +2061,7 @@ std::shared_ptr<MerkleBlock> Vault::insertMerkleBlock_unwrapped(std::shared_ptr<
     LOGGER(debug) << "Vault::insertMerkleBlock_unwrapped - inserting merkle block. hash: " << new_blockheader_hash << ", height: " << new_blockheader->height() << std::endl;
     db_->persist(new_blockheader);
     db_->persist(merkleblock);
+    notifyMerkleBlockInserted(merkleblock);
 
     // Confirm transactions
     const auto& hashes = merkleblock->hashes();
@@ -1797,6 +2076,7 @@ std::shared_ptr<MerkleBlock> Vault::insertMerkleBlock_unwrapped(std::shared_ptr<
         LOGGER(debug) << "Vault::insertMerkleBlock_unwrapped - confirming transaction. hash: " << uchar_vector(tx.hash()).getHex() << std::endl;
         tx.blockheader(new_blockheader);
         db_->update(tx);
+        notifyTxStatusChanged(std::make_shared<Tx>(tx));
     }
 
     return merkleblock;     
@@ -1835,6 +2115,7 @@ unsigned int Vault::deleteMerkleBlock_unwrapped(uint32_t height)
             LOGGER(debug) << "Vault::deleteMerkleBlock_unwrapped - unconfirming transaction. hash: " << uchar_vector(tx.hash()).getHex() << std::endl;
             tx.blockheader(nullptr);
             db_->update(tx);
+            notifyTxStatusChanged(std::make_shared<Tx>(tx));
         }
 
         // Delete merkle block
@@ -1864,6 +2145,7 @@ unsigned int Vault::updateConfirmations_unwrapped(std::shared_ptr<Tx> tx)
         std::shared_ptr<BlockHeader> blockheader(db_->load<BlockHeader>(view.blockheader_id));
         tx->blockheader(blockheader);
         db_->update(tx);
+        notifyTxStatusChanged(tx);
         count++;
         LOGGER(debug) << "Vault::updateConfirmations_unwrapped - transaction " << uchar_vector(tx->hash()).getHex() << " confirmed in block " << uchar_vector(tx->blockheader()->hash()).getHex() << " height: " << tx->blockheader()->height() << std::endl;
     }

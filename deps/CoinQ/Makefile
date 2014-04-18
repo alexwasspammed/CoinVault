@@ -5,10 +5,18 @@ else
     CXX_FLAGS += -O3
 endif
 
-INCLUDE_PATH = \
-    -Isrc \
-    -I../CoinClasses/src \
-    -I../logger/src
+LOCAL_SYSROOT = ../../sysroot
+
+ifndef SYSROOT
+    SYSROOT = /usr/local
+endif
+
+INCLUDE_PATH += \
+    -Isrc
+
+ifneq ($(wildcard $(LOCAL_SYSROOT)/include),)
+    INCLUDE_PATH += -I$(LOCAL_SYSROOT)/include
+endif
 
 ifndef OS
     UNAME_S := $(shell uname -s)
@@ -61,7 +69,6 @@ OBJS = \
     obj/CoinQ_keys.o \
     obj/CoinQ_filter.o
 
-
 all: lib/libCoinQ.a
 
 lib/libCoinQ.a: $(OBJS)
@@ -69,6 +76,16 @@ lib/libCoinQ.a: $(OBJS)
 
 obj/%.o: src/%.cpp
 	$(CXX) $(CXX_FLAGS) -c -o $@ $< $(INCLUDE_PATH)
+
+install:
+	-mkdir -p $(SYSROOT)/include/CoinQ
+	-rsync -u src/*.h  $(SYSROOT)/include/CoinQ/
+	-mkdir -p $(SYSROOT)/lib
+	-rsync -u lib/libCoinQ.a $(SYSROOT)/lib/
+
+remove:
+	-rm -rf $(SYSROOT)/include/CoinQ
+	-rm $(SYSROOT)/lib/libCoinQ.a
 
 clean:
 	-rm -f obj/*.o lib/*.a

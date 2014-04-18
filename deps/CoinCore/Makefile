@@ -7,6 +7,15 @@ else
     CXX_FLAGS += -O3
 endif
 
+LOCAL_SYSROOT = ../../sysroot
+
+ifndef SYSROOT
+    SYSROOT = /usr/local
+endif
+
+INCLUDE_PATH += \
+    -I$(LOCAL_SYSROOT)/include
+
 ifndef OS
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S), Linux)
@@ -70,7 +79,6 @@ OBJ_HEADERS = \
         src/numericdata.h \
         src/random.h \
         src/typedefs.h \
-        src/uchar_vector.h \
         src/uint256.h
 
 SCRYPT_OBJS = \
@@ -84,9 +92,9 @@ HASH9_OBJS = \
 	src/hashfunc/obj/keccak.o \
 	src/hashfunc/obj/skein.o
 
-all: lib/libCoinClasses.a $(OBJS) $(SCRYPT_OBJS) $(HASH9_OBJS)
+all: lib/libCoinCore.a $(OBJS) $(SCRYPT_OBJS) $(HASH9_OBJS)
 
-lib/libCoinClasses.a: $(OBJS) $(SCRYPT_OBJS) $(HASH9_OBJS)
+lib/libCoinCore.a: $(OBJS) $(SCRYPT_OBJS) $(HASH9_OBJS)
 	$(ARCHIVER) rcs $@ $^
 
 obj/%.o: src/%.cpp src/%.h $(OBJ_HEADERS)
@@ -97,6 +105,20 @@ src/scrypt/obj/scrypt.o: src/scrypt/scrypt.cpp src/scrypt/scrypt.h
 
 src/hashfunc/obj/%.o: src/hashfunc/%.c src/hashfunc/sph_%.h src/hashfunc/sph_types.h
 	$(CC) $(C_FLAGS) $(INCLUDE_PATH) -c $< -o $@
+
+install:
+	-mkdir -p $(SYSROOT)/include/CoinCore
+	-rsync -u src/*.h $(SYSROOT)/include/CoinCore/
+	-mkdir -p $(SYSROOT)/include/CoinCore/hashfunc
+	-rsync -u src/hashfunc/*.h $(SYSROOT)/include/CoinCore/hashfunc/
+	-mkdir -p $(SYSROOT)/include/CoinCore/scrypt
+	-rsync -u src/scrypt/*.h $(SYSROOT)/include/CoinCore/scrypt/
+	-mkdir -p $(SYSROOT)/lib
+	-rsync -u lib/libCoinCore.a $(SYSROOT)/lib/
+
+remove:
+	-rm -rf $(SYSROOT)/include/CoinCore
+	-rm $(SYSROOT)/lib/libCoinCore.a
 
 clean:
 	-rm -f obj/*.o lib/*.a src/scrypt/obj/*.o src/hashfunc/obj/*.o

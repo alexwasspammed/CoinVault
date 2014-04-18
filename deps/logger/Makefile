@@ -5,6 +5,10 @@ else
     CXX_FLAGS += -O3
 endif
 
+ifndef SYSROOT
+    SYSROOT = /usr/local
+endif
+
 ifndef OS
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S), Linux)
@@ -36,5 +40,15 @@ lib/liblogger.a: obj/logger.o
 obj/logger.o: src/logger.cpp src/logger.h
 	$(CXX) $(CXX_FLAGS) -c -o $@ $<
 
+install:
+	-mkdir -p $(SYSROOT)/include/logger
+	-rsync -u src/logger.h $(SYSROOT)/include/logger/
+	-mkdir -p $(SYSROOT)/lib
+	-rsync -u lib/liblogger.a $(SYSROOT)/lib/
+
+remove:
+	-rm -rf $(SYSROOT)/include/logger
+	-rm $(SYSROOT)/lib/liblogger.a
+
 clean:
-	rm -f obj/*.o lib/*.a
+	rm -f obj/*.o lib/*.a/

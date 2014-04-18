@@ -22,13 +22,13 @@
 #include "mainwindow.h"
 
 // Random
-#include <random.h>
+#include <CoinCore/random.h>
 
 // Coin scripts
-#include <CoinQ_script.h>
+#include <CoinQ/CoinQ_script.h>
 
 // Network
-#include <CoinQ_netsync.h>
+#include <CoinQ/CoinQ_netsync.h>
 
 // Models/Views
 #include "accountmodel.h"
@@ -493,7 +493,7 @@ void MainWindow::importKeychain(QString fileName)
             this,
             tr("Import Keychain"),
             lastVaultDir,
-            tr("Keychains") + "(*.keys)");
+            tr("Keychains") + "(*.priv *.pub)");
     }
     if (fileName.isEmpty()) return;
 
@@ -559,13 +559,13 @@ void MainWindow::exportKeychain(bool exportPrivate)
     QStandardItem* nameItem = keychainModel->item(row, 0);
     QString name = nameItem->data(Qt::DisplayRole).toString();
 
-    QString fileName = name + (exportPrivate ? ".priv.keys" : ".pub.keys");
+    QString fileName = name + (exportPrivate ? ".priv" : ".pub");
 
     fileName = QFileDialog::getSaveFileName(
         this,
         tr("Exporting ") + (exportPrivate ? tr("Private") : tr("Public")) + tr(" Keychain - ") + name,
         lastVaultDir + "/" + fileName,
-        tr("Keychains (*.keys)"));
+        tr("Keychains (*.priv *.pub)"));
 
     if (fileName.isEmpty()) return;
 
@@ -1037,7 +1037,7 @@ void MainWindow::createTx(const PaymentRequest& paymentRequest)
                 if (!connected) {
                     throw std::runtime_error(tr("Must be connected to network to send.").toStdString());
                 }
-                Coin::Transaction coin_tx = tx->toCoinClasses();
+                Coin::Transaction coin_tx = tx->toCoinCore();
                 networkSync.sendTx(coin_tx);
 
                 // TODO: Check transaction has propagated before changing status

@@ -10,8 +10,8 @@
 
 #include "txmodel.h"
 
-#include <CoinQ_script.h>
-#include <CoinQ_netsync.h>
+#include <CoinQ/CoinQ_script.h>
+#include <CoinQ/CoinQ_netsync.h>
 
 #include <stdutils/stringutils.h>
 
@@ -51,7 +51,7 @@ TxModel::TxModel(CoinDB::Vault* vault, const QString& accountName, QObject* pare
 void TxModel::initColumns()
 {
     QStringList columns;
-    columns << tr("Time") << tr("Description") << tr("Type") << tr("Amount") << tr("Fee") << tr("Balance") << tr("Confirmations") << tr("Address") << tr("Transaction ID");
+    columns << tr("Time") << tr("Description") << tr("Type") << tr("Amount") << tr("Fee") << tr("Balance") << tr("Confirmations") << tr("Address") << tr("Transaction Hash");
     setHorizontalHeaderLabels(columns);
 }
 
@@ -258,7 +258,7 @@ void TxModel::sendTx(int row, CoinQ::Network::NetworkSync* networkSync)
     txhash.setHex(txHashItem->text().toStdString());
 
     std::shared_ptr<CoinDB::Tx> tx = vault->getTx(txhash);
-    Coin::Transaction coin_tx = tx->toCoinClasses();
+    Coin::Transaction coin_tx = tx->toCoinCore();
     networkSync->sendTx(coin_tx);
 
     // TODO: Check transaction has propagated before changing status to PROPAGATED
